@@ -1,4 +1,6 @@
-# Pyrate Sounds
+<img width="350" height="720" alt="Screenshot 2026-10-16 at 13 16 15" src="https://github.com/user-attachments/assets/396392e2-f6aa-4c4e-95c9-47ba96682749" />
+
+# Pyrate Sounds Mixer
 
 A menu bar app that gives every app on your Mac its own volume slider and output mapping, a feature macOS has been meaning to get around to since about 2001.
 
