@@ -20,7 +20,6 @@ struct SourceRowModel: Identifiable, Equatable {
     var capabilities: SourceCapabilities
     var eq: SourceEQ
     var eqPresetName: String?
-    var isLeveled: Bool
     var effects: SourceEffects = .neutral
     var route: RouteResolution = .system
 }
@@ -56,8 +55,6 @@ final class AppStore {
     private(set) var masterDragLevel: Double?
     private(set) var rows: [SourceRowModel] = []
     private(set) var activity: [SourceID: Float] = [:]
-    /// Live leveler adjustment per source in dB, refreshed while the panel is open.
-    private(set) var levelerAdjustments: [SourceID: Float] = [:]
     private(set) var feedback: Feedback?
     private(set) var permissionSuspected = false
     private(set) var showPermissionNote = false
@@ -96,16 +93,20 @@ final class AppStore {
     // Phase 3 state (logic lives in AppStore+Profiles.swift)
     @ObservationIgnored var ruleEngine = RuleEngine()
     @ObservationIgnored var editStartVolume: [SourceID: VolumeState] = [:]
+    /// EQ set by rules. Temporary like rule volumes: never written to preferences.
+    @ObservationIgnored var sessionEQ: [SourceID: SourceEQ] = [:]
+    /// Per-app EQ undo history for this session. A burst of changes (one slider
+    /// drag) is one step.
+    @ObservationIgnored var eqHistory: [SourceID: [SourceEQ]] = [:]
+    @ObservationIgnored var eqHistoryStamp: [SourceID: Date] = [:]
+    private(set) var eqUndoDepth: [SourceID: Int] = [:]
     @ObservationIgnored var activitySaveTask: Task<Void, Never>?
     private(set) var activityLog = ActivityLog()
     var lastProfileUndo: ProfileUndo?
 
     init(preferencesStore: PreferencesStore = PreferencesStore(fileURL: PreferencesStore.defaultURL())) {
         self.preferencesStore = preferencesStore
-        var loaded = preferencesStore.load()
-        // Loudness normalizing has no UI; the DSP stays available but is never engaged.
-        loaded.leveling.isEnabled = false
-        self.preferences = loaded
+        self.preferences = preferencesStore.load()
         self.activityLog = Self.loadActivity()
     }
 
@@ -412,22 +413,45 @@ final class AppStore {
 
     func dismissPermissionNote() { showPermissionNote = false }
 
+    private func pushEQHistory(for id: SourceID) {
+        let now = Date()
+        if let last = eqHistoryStamp[id], now.timeIntervalSince(last) < 0.8, eqHistory[id]?.isEmpty == false {
+            eqHistoryStamp[id] = now
+            return
+        }
+        var stack = eqHistory[id] ?? []
+        stack.append(eq(for: id))
+        if stack.count > 30 { stack.removeFirst(stack.count - 30) }
+        eqHistory[id] = stack
+        eqHistoryStamp[id] = now
+        eqUndoDepth[id] = stack.count
+    }
+
+    func undoEQ(_ id: SourceID) {
+        guard var stack = eqHistory[id], let previous = stack.popLast() else { return }
+        eqHistory[id] = stack
+        eqHistoryStamp[id] = nil
+        eqUndoDepth[id] = stack.count
+        applyEQ(previous, to: id, recordUndo: false)
+    }
+
     // MARK: Equalizer (per source)
 
     var eqPresets: [EQPreset] { preferences.allEQPresets }
 
-    func eq(for id: SourceID) -> SourceEQ { preferences.eq(for: id) }
+    /// The EQ playing now: a rule's temporary EQ if one is active, else the saved one.
+    func eq(for id: SourceID) -> SourceEQ { sessionEQ[id] ?? preferences.eq(for: id) }
 
     /// "Bass Boost", "Bass Boost (edited)", "Custom", or nil when EQ is off.
     func eqLabel(for id: SourceID) -> String? {
-        let eq = preferences.eq(for: id)
+        let eq = self.eq(for: id)
         guard eq.isActive || eq.isBypassed && !eq.isFlat else { return nil }
         guard let preset = preferences.eqPreset(id: eq.presetID) else { return "Custom" }
         return eq.isModified(from: preset) ? "\(preset.name) (edited)" : preset.name
     }
 
     func selectEQPreset(_ preset: EQPreset, for id: SourceID) {
-        var eq = preferences.eq(for: id)
+        var eq = self.eq(for: id)
         eq.apply(preset)
         eq.isBypassed = false
         applyEQ(eq, to: id)
@@ -435,19 +459,19 @@ final class AppStore {
     }
 
     func setEQGain(_ db: Double, band: Int, for id: SourceID) {
-        var eq = preferences.eq(for: id)
+        var eq = self.eq(for: id)
         eq.setGain((db * 2).rounded() / 2, band: band)
         applyEQ(eq, to: id)
     }
 
     func toggleEQBypass(_ id: SourceID) {
-        var eq = preferences.eq(for: id)
+        var eq = self.eq(for: id)
         eq.isBypassed.toggle()
         applyEQ(eq, to: id)
     }
 
     func setEQMatchLoudness(_ on: Bool, for id: SourceID) {
-        var eq = preferences.eq(for: id)
+        var eq = self.eq(for: id)
         eq.matchLoudness = on
         applyEQ(eq, to: id)
     }
@@ -458,9 +482,10 @@ final class AppStore {
 
     func saveEQPreset(named name: String, from id: SourceID) {
         var created: EQPreset?
-        mutatePreferences { created = $0.addCustomPreset(named: name, gains: $0.eq(for: id).gains) }
+        let gains = self.eq(for: id).gains
+        mutatePreferences { created = $0.addCustomPreset(named: name, gains: gains) }
         if let created {
-            var eq = preferences.eq(for: id)
+            var eq = self.eq(for: id)
             eq.presetID = created.id
             applyEQ(eq, to: id)
             show(.success, "Saved preset \(created.name).")
@@ -479,10 +504,19 @@ final class AppStore {
         show(.info, "Deleted \(name). Apps using it keep their current sound.")
     }
 
-    func applyEQ(_ eq: SourceEQ, to id: SourceID, origin: ChangeOrigin = .user) {
-        if origin == .user { ruleEngine.userChanged(.eq(id)) }
+    func applyEQ(_ eq: SourceEQ, to id: SourceID, origin: ChangeOrigin = .user, recordUndo: Bool = true) {
+        if origin == .user {
+            ruleEngine.userChanged(.eq(id))
+            if recordUndo { pushEQHistory(for: id) }
+        }
         let name = rows.first { $0.id == id }?.name
-        mutatePreferences { $0.setEQ(eq, for: id, name: name) }
+        if origin == .rule {
+            // Restoring the saved EQ simply ends the temporary one.
+            sessionEQ[id] = eq == preferences.eq(for: id) ? nil : eq
+        } else {
+            sessionEQ[id] = nil
+            mutatePreferences { $0.setEQ(eq, for: id, name: name) }
+        }
         if eq.isActive && !preferences.hasSeenPermissionExplanation {
             showPermissionNote = true
             mutatePreferences { $0.hasSeenPermissionExplanation = true }
@@ -565,6 +599,14 @@ final class AppStore {
         }
     }
 
+    /// Sets an app's route quietly (profiles, undo). A device that isn't connected
+    /// is kept, so the app falls back now and moves over when it connects.
+    func applyRoute(_ device: RememberedDevice?, for id: SourceID) {
+        mutatePreferences { $0.setRoute(device, for: id, name: self.rows.first { $0.id == id }?.name) }
+        rebuildRows()
+        reconcileTaps()
+    }
+
     func setEffects(_ effects: SourceEffects, for id: SourceID) {
         mutatePreferences { $0.setEffects(effects, for: id, name: self.rows.first { $0.id == id }?.name) }
         if let index = rows.firstIndex(where: { $0.id == id }) { rows[index].effects = effects }
@@ -574,10 +616,9 @@ final class AppStore {
     /// Swaps in a whole configuration (import or restore) and brings every
     /// service in line with it. Session-only state is reset so the new settings apply.
     func replacePreferences(_ new: Preferences) {
-        var p = new
-        p.leveling.isEnabled = false
-        preferences = p
+        preferences = new
         sessionVolumes = [:]
+        sessionEQ = [:]
         ruleEngine = RuleEngine()
         lastProfileUndo = nil
         saveNow()
@@ -683,9 +724,8 @@ final class AppStore {
                 isPinned: preferences.isPinned(id),
                 isShared: source?.isShared ?? (id == .sharedWebKit),
                 capabilities: capabilities,
-                eq: preferences.eq(for: id),
+                eq: self.eq(for: id),
                 eqPresetName: eqLabel(for: id),
-                isLeveled: preferences.isLeveled(id),
                 effects: preferences.effects(for: id),
                 route: routeResolution(for: id))
         }
@@ -699,18 +739,16 @@ final class AppStore {
         if let systemOutput = currentOutput, systemOutput.isAlive {
             for (id, source) in discovered {
                 let v = volume(for: id)
-                let eq = preferences.eq(for: id)
-                let leveled = preferences.isLeveled(id)
+                let eq = self.eq(for: id)
                 let effects = preferences.effects(for: id)
                 let route = routeResolution(for: id)
-                guard TapCoordinator.Request.needsTap(volume: v, eq: eq, leveled: leveled, isActive: source.isActive,
-                                                      effects: effects, routed: route.needsTap) else { continue }
+                guard TapCoordinator.Request.needsTap(volume: v, eq: eq, effects: effects, routed: route.needsTap) else { continue }
                 var destinationUID = systemOutput.id.uid
                 if case .routed(let device) = route { destinationUID = device.uid }
                 let name = rows.first { $0.id == id }?.name ?? id.rawValue
                 desired[id] = .init(name: name, processObjectIDs: source.processObjectIDs,
                                     destinationUID: destinationUID, gain: v.gain, eq: eq,
-                                    leveling: leveled ? preferences.leveling : nil, effects: effects)
+                                    effects: effects)
             }
         }
         let errorsBefore = taps.errors
@@ -733,7 +771,6 @@ final class AppStore {
         meterTimer?.invalidate()
         meterTimer = nil
         activity = [:]
-        levelerAdjustments = [:]
     }
 
     private func tickMeters() {
@@ -753,11 +790,6 @@ final class AppStore {
             }
         }
         if next != activity { activity = next }
-        var adjustments: [SourceID: Float] = [:]
-        for row in rows where row.isLeveled {
-            if let db = taps.levelerAdjustment(row.id) { adjustments[row.id] = (db * 2).rounded() / 2 }
-        }
-        if adjustments != levelerAdjustments { levelerAdjustments = adjustments }
         if suspect != permissionSuspected { permissionSuspected = suspect }
     }
 
@@ -766,38 +798,6 @@ final class AppStore {
     func updateInterface(_ change: (inout InterfacePreferences) -> Void) {
         mutatePreferences { change(&$0.interface) }
         rebuildRows()
-    }
-
-    // MARK: Leveling
-
-    func setLevelingEnabled(_ on: Bool) {
-        mutatePreferences { $0.leveling.isEnabled = on }
-        if on && !preferences.hasSeenPermissionExplanation {
-            showPermissionNote = true
-            mutatePreferences { $0.hasSeenPermissionExplanation = true }
-        }
-        rebuildRows()
-        reconcileTaps()
-        show(.info, on ? "Normalizing app loudness. Adjustments are small and take a few seconds." : "Loudness normalizing off.")
-    }
-
-    func setLevelingTarget(_ target: LevelingSettings.Target) {
-        mutatePreferences { $0.leveling.target = target }
-        taps.resetLevelerMemory()
-        reconcileTaps()
-    }
-
-    func setLevelingBoostOnly(_ on: Bool) {
-        mutatePreferences { $0.leveling.boostOnly = on }
-        taps.resetLevelerMemory()
-        reconcileTaps()
-    }
-
-    func setExcludedFromLeveling(_ excluded: Bool, for id: SourceID) {
-        let name = rows.first { $0.id == id }?.name
-        mutatePreferences { $0.setExcludedFromLeveling(excluded, for: id, name: name) }
-        rebuildRows()
-        reconcileTaps()
     }
 
     func setRememberAppVolumes(_ remember: Bool) {

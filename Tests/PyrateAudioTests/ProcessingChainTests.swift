@@ -181,9 +181,10 @@ struct ProcessingChainTests {
     }
 }
 
-/// Lookahead limiter and loudness leveler, driven offline like the IOProc would.
-@Suite("Limiter and leveler")
-struct LimiterLevelerTests {
+/// The lookahead limiter, driven offline like the IOProc would.
+@Suite("Limiter")
+@MainActor
+struct LimiterTests {
     let rate = 48000.0
     let block = 512
 
@@ -249,109 +250,6 @@ struct LimiterLevelerTests {
         let out = run(chain, seconds: 0.05) { $0 == 1000 ? 1 : 0 }
         let expected = 1000 + Int((GraphicEQ.limiterLookaheadSeconds * rate).rounded()) - 1
         #expect(out.firstIndex { abs($0) > 0.01 } == expected)
-    }
-
-    func normalizer(_ target: LevelingSettings.Target = .balanced, boostOnly: Bool = false) -> LevelingSettings {
-        LevelingSettings(isEnabled: true, target: target, boostOnly: boostOnly)
-    }
-
-    /// Amplitude of a 1 kHz sine (both channels) with a given BS.1770 loudness.
-    func amplitude(lufs: Double) -> Float {
-        Float(sqrt(pow(10, (lufs - LevelerTuning.loudnessOffset) / 10)))
-    }
-
-    @Test func quietSourcesAreRaisedUpToTheCap() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer())
-        _ = run(chain, seconds: 15, signal: sine(1000, amplitude(lufs: -30)))
-        #expect(abs(chain.levelerAdjustmentDB - Float(LevelerTuning.maxAdjustDB)) < 0.05)
-    }
-
-    @Test func loudSourcesAreLoweredByAtMostTheCap() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer())
-        _ = run(chain, seconds: 15, signal: sine(1000, amplitude(lufs: -4)))
-        #expect(abs(chain.levelerAdjustmentDB + Float(LevelerTuning.maxAdjustDB)) < 0.05)
-    }
-
-    @Test func modestOffsetsReachTheExactTrim() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer())
-        _ = run(chain, seconds: 15, signal: sine(1000, amplitude(lufs: -18)))
-        // K-weighting shifts a 1 kHz tone slightly, so the measured loudness differs a little.
-        let k = LevelerTuning.kWeighting(sampleRate: rate).reduce(0) { $0 + $1.magnitudeDB(at: 1000, sampleRate: rate) }
-        #expect(abs(Double(chain.levelerAdjustmentDB) - (4 - k)) < 0.15)
-    }
-
-    @Test func nothingChangesInsideTheDeadband() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer())
-        _ = run(chain, seconds: 15, signal: sine(1000, amplitude(lufs: -12.8)))
-        #expect(chain.levelerAdjustmentDB == 0)
-    }
-
-    @Test func waitsForEnoughAudioBeforeActing() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer())
-        _ = run(chain, seconds: 2.5, signal: sine(1000, amplitude(lufs: -30)))
-        #expect(chain.levelerAdjustmentDB == 0)
-    }
-
-    @Test func dynamicMusicGetsOneSteadyTrimNotRiding() {
-        // Loud chorus and quiet verse alternating every 2 s, 10 dB apart.
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer())
-        let loud = amplitude(lufs: -6), quiet = amplitude(lufs: -16)
-        let signal: (Int) -> Float = { n in
-            let section = (n / 96000) % 2 == 0 ? loud : quiet
-            return section * Float(sin(2 * .pi * 1000 * Double(n) / 48000))
-        }
-        _ = run(chain, seconds: 20, signal: signal)
-        var readings: [Float] = []
-        var offset = Int(rate * 20)
-        for _ in 0..<12 {
-            let start = offset
-            _ = run(chain, seconds: 1) { signal(start + $0) }
-            offset += Int(rate)
-            readings.append(chain.levelerAdjustmentDB)
-        }
-        #expect(readings.max()! - readings.min()! < 0.5, "trim moved: \(readings)")
-        #expect(readings.last! < -3)
-    }
-
-    @Test func silenceHoldsTheTrim() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer())
-        _ = run(chain, seconds: 15, signal: sine(1000, amplitude(lufs: -18)))
-        let settled = chain.levelerAdjustmentDB
-        _ = run(chain, seconds: 10) { _ in 0 }
-        #expect(chain.levelerAdjustmentDB == settled)
-    }
-
-    @Test func boostOnlyNeverCuts() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer(boostOnly: true))
-        _ = run(chain, seconds: 15, signal: sine(1000, amplitude(lufs: -4)))
-        #expect(chain.levelerAdjustmentDB == 0)
-    }
-
-    @Test func turningOffGlidesBackToUnity() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.setLeveling(normalizer())
-        _ = run(chain, seconds: 15, signal: sine(1000, amplitude(lufs: -4)))
-        chain.setLeveling(nil)
-        _ = run(chain, seconds: 3, signal: sine(1000, amplitude(lufs: -4)))
-        #expect(chain.levelerAdjustmentDB < -2)  // gliding, not jumping
-        _ = run(chain, seconds: 5, signal: sine(1000, amplitude(lufs: -4)))
-        #expect(chain.levelerAdjustmentDB == 0)
-    }
-
-    @Test func seededTrimIsUsedImmediately() {
-        let chain = ProcessingChain(gain: 1, sampleRate: rate)
-        chain.seedLeveler(-4)
-        chain.setLeveling(normalizer())
-        _ = run(chain, seconds: 1, signal: sine(1000, amplitude(lufs: -10)))
-        #expect(chain.levelerAdjustmentDB == -4)
     }
 }
 
@@ -502,5 +400,57 @@ struct EffectRackTests {
             }
         }
         #expect(output.allSatisfy { $0.isFinite && abs($0) <= 1 })
+    }
+}
+
+@Suite("Click-free changes")
+@MainActor
+struct ClickFreeTests {
+    /// Streams a left-only tone, applies a change after 4 blocks, and returns the
+    /// largest sample-to-sample jump in the left output around the change.
+    func largestJump(after change: (ProcessingChain) -> Void, setup: (ProcessingChain) -> Void = { _ in }) -> Float {
+        let chain = ProcessingChain(gain: 0.5, sampleRate: 48000)
+        setup(chain)
+        var out: [Float] = []
+        var input = [Float](repeating: 0, count: 512 * 2)
+        var output = [Float](repeating: 0, count: 512 * 2)
+        var n = 0
+        for block in 0..<12 {
+            if block == 4 { change(chain) }
+            for i in 0..<512 {
+                input[i * 2] = 0.4 * Float(sin(2 * .pi * 200 * Double(n + i) / 48000))
+                input[i * 2 + 1] = 0
+            }
+            input.withUnsafeMutableBufferPointer { inp in
+                output.withUnsafeMutableBufferPointer { o in
+                    chain.process(inL: inp.baseAddress!, inLStride: 2, inR: inp.baseAddress! + 1, inRStride: 2,
+                                  outL: o.baseAddress!, outLStride: 2, outR: o.baseAddress! + 1, outRStride: 2,
+                                  mono: false, frames: 512)
+                }
+            }
+            for i in 0..<512 { out.append(output[i * 2]) }
+            n += 512
+        }
+        var jump: Float = 0
+        for i in 1024..<out.count { jump = max(jump, abs(out[i] - out[i - 1])) }
+        return jump
+    }
+
+    // A 200 Hz tone at 0.2 peak moves at most about 0.0053 per sample.
+    let smooth: Float = 0.012
+
+    @Test func channelModeSwitchesWithoutClicks() {
+        // Swapping moves the tone from left to right: without a fade, left drops to zero instantly.
+        #expect(largestJump(after: { $0.setEffects(SourceEffects(channelMode: .swapped)) }) < smooth)
+        #expect(largestJump(after: { $0.setEffects(SourceEffects(channelMode: .mono)) }) < smooth)
+    }
+
+    @Test func bypassingAnEffectFadesInsteadOfCutting() {
+        var filter = RackEffect(kind: "lpas", parameters: [0: 100])
+        let jump = largestJump(after: { chain in
+            filter.isBypassed = true
+            chain.setEffects(SourceEffects(rack: [filter]))
+        }, setup: { $0.setEffects(SourceEffects(rack: [filter])) })
+        #expect(jump < smooth)
     }
 }

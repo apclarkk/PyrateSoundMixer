@@ -8,6 +8,8 @@
     <string>Pyrate Sounds</string>
     <key>CFBundleExecutable</key>
     <string>PyrateSounds</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>org.pyratesounds.PyrateSounds</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -20,6 +22,8 @@
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.4</string>
     <key>LSUIElement</key>

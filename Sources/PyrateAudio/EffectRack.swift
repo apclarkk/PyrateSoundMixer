@@ -149,6 +149,9 @@ public final class EffectRack: @unchecked Sendable {
     private let count: Int
     private let units: UnsafeMutablePointer<AudioUnit?>
     private let bypassed: UnsafeMutablePointer<Int32>
+    /// Realtime-owned wet amount per unit (0 bypassed, 1 on), ramped so bypass fades.
+    private let mix: UnsafeMutablePointer<Float>
+    private let fadeStep: Float
     private let context: UnsafeMutablePointer<RackRenderContext>
     private let outLeft: UnsafeMutablePointer<Float>
     private let outRight: UnsafeMutablePointer<Float>
@@ -166,6 +169,9 @@ public final class EffectRack: @unchecked Sendable {
         units.initialize(repeating: nil, count: max(count, 1))
         bypassed = .allocate(capacity: max(count, 1))
         bypassed.initialize(repeating: 0, count: max(count, 1))
+        mix = .allocate(capacity: max(count, 1))
+        mix.initialize(repeating: 1, count: max(count, 1))
+        fadeStep = Float(1 / (0.03 * max(sampleRate, 1)))
         context = .allocate(capacity: 1)
         context.initialize(to: RackRenderContext())
         outLeft = .allocate(capacity: Self.maxFrames)
@@ -178,6 +184,7 @@ public final class EffectRack: @unchecked Sendable {
             if let unit = makeUnit(effect) {
                 units[index] = unit
                 bypassed[index] = effect.isBypassed ? 1 : 0
+                mix[index] = effect.isBypassed ? 0 : 1
                 unitIndex[effect.id] = index
             } else {
                 skipped.append(effect.kind)
@@ -194,6 +201,7 @@ public final class EffectRack: @unchecked Sendable {
         }
         units.deallocate()
         bypassed.deallocate()
+        mix.deallocate()
         context.deallocate()
         outLeft.deallocate()
         outRight.deallocate()
@@ -256,15 +264,31 @@ public final class EffectRack: @unchecked Sendable {
         timestamp.mSampleTime = sampleTime
         timestamp.mFlags = .sampleTimeValid
         for index in 0..<count {
-            guard let unit = units[index], bypassed[index] == 0 else { continue }
+            guard let unit = units[index] else { continue }
+            // Bypass fades the effect out (and back in) over 30 ms instead of cutting.
+            let target: Float = bypassed[index] == 0 ? 1 : 0
+            let start = mix[index]
+            if start == 0 && target == 0 { continue }
             context.pointee.left = left
             context.pointee.right = right
             bufferList[0] = AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(bytes), mData: UnsafeMutableRawPointer(outLeft))
             bufferList[1] = AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(bytes), mData: UnsafeMutableRawPointer(outRight))
             var flags = AudioUnitRenderActionFlags()
-            guard AudioUnitRender(unit, &flags, &timestamp, 0, UInt32(frames), bufferList.unsafeMutablePointer) == noErr else { continue }
-            if let l = bufferList[0].mData { memcpy(left, l, bytes) }
-            if let r = bufferList[1].mData { memcpy(right, r, bytes) }
+            guard AudioUnitRender(unit, &flags, &timestamp, 0, UInt32(frames), bufferList.unsafeMutablePointer) == noErr,
+                  let wetL = bufferList[0].mData?.assumingMemoryBound(to: Float.self),
+                  let wetR = bufferList[1].mData?.assumingMemoryBound(to: Float.self) else { continue }
+            if start == 1 && target == 1 {
+                memcpy(left, wetL, bytes)
+                memcpy(right, wetR, bytes)
+            } else {
+                var m = start
+                for i in 0..<frames {
+                    m = target > m ? min(m + fadeStep, target) : max(m - fadeStep, target)
+                    left[i] += (wetL[i] - left[i]) * m
+                    right[i] += (wetR[i] - right[i]) * m
+                }
+                mix[index] = m
+            }
         }
         sampleTime += Float64(frames)
     }

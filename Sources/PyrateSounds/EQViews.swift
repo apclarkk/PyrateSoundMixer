@@ -233,6 +233,10 @@ struct EQDrawer: View {
 
     private func footer(current: EQPreset?) -> some View {
         HStack(spacing: 10) {
+            Button("Undo") { store.undoEQ(row.id) }
+                .disabled((store.eqUndoDepth[row.id] ?? 0) == 0)
+                .keyboardShortcut(naming == nil ? KeyboardShortcut("z") : nil)
+                .help("Undo the last EQ change for \(row.name)")
             Button("Reset") { store.resetEQ(row.id) }
                 .disabled(row.eq.isFlat)
             Toggle("Match loudness", isOn: Binding(

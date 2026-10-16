@@ -7,8 +7,6 @@ public struct AppPreference: Codable, Equatable, Sendable {
     public var lastKnownName: String?
     /// Per-app EQ. Always remembered, independent of the "remember volumes" setting.
     public var eq: SourceEQ?
-    /// True to keep this app out of cross-app loudness leveling.
-    public var excludeFromLeveling: Bool?
     /// Balance and channel mode.
     public var effects: SourceEffects?
     /// Output this app plays through instead of the system output (nil = follow the system).
@@ -71,7 +69,6 @@ public struct Preferences: Codable, Equatable, Sendable {
     public var preferredOutput: RememberedDevice?
     public var hasSeenPermissionExplanation: Bool = false
     public var customEQPresets: [EQPreset] = []
-    public var leveling = LevelingSettings()
     public var shortcuts: [ShortcutBinding] = []
     public var preferredInput: RememberedDevice?
     public var profiles: [Profile] = []
@@ -110,17 +107,6 @@ public struct Preferences: Codable, Equatable, Sendable {
         apps[id] = pref
     }
 
-    /// Whether leveling applies to a source right now.
-    public func isLeveled(_ id: SourceID) -> Bool {
-        leveling.isEnabled && apps[id]?.excludeFromLeveling != true
-    }
-
-    public mutating func setExcludedFromLeveling(_ excluded: Bool, for id: SourceID, name: String?) {
-        var pref = apps[id] ?? AppPreference(volume: volume(for: id))
-        pref.excludeFromLeveling = excluded ? true : nil
-        if let name { pref.lastKnownName = name }
-        apps[id] = pref
-    }
 
     public var allEQPresets: [EQPreset] { EQPreset.builtIns + customEQPresets }
 
@@ -207,7 +193,6 @@ public struct Preferences: Codable, Equatable, Sendable {
         preferredOutput = try c.decodeIfPresent(RememberedDevice.self, forKey: .preferredOutput)
         hasSeenPermissionExplanation = try c.decodeIfPresent(Bool.self, forKey: .hasSeenPermissionExplanation) ?? false
         customEQPresets = try c.decodeIfPresent([EQPreset].self, forKey: .customEQPresets) ?? []
-        leveling = try c.decodeIfPresent(LevelingSettings.self, forKey: .leveling) ?? LevelingSettings()
         shortcuts = try c.decodeIfPresent([ShortcutBinding].self, forKey: .shortcuts) ?? []
         preferredInput = try c.decodeIfPresent(RememberedDevice.self, forKey: .preferredInput)
         profiles = try c.decodeIfPresent([Profile].self, forKey: .profiles) ?? []

@@ -37,7 +37,11 @@ extension AppStore {
             var setting = ProfileAppSetting()
             if aspects.contains(.appVolumes) { setting.volume = volume(for: id) }
             if aspects.contains(.appEQ), eq(for: id) != .off { setting.eq = eq(for: id) }
-            if setting.volume != nil || setting.eq != nil { profile.apps[id] = setting }
+            if aspects.contains(.appEffects) { setting.effects = preferences.effects(for: id) }
+            if aspects.contains(.appRoutes) {
+                setting.route = preferences.route(for: id).map { .device($0) } ?? .system
+            }
+            if !setting.isEmpty { profile.apps[id] = setting }
         }
         if aspects.contains(.outputDevice), let d = currentOutput { profile.output = RememberedDevice(id: d.id, lastKnownName: d.name) }
         if aspects.contains(.inputDevice), let d = currentInput { profile.input = RememberedDevice(id: d.id, lastKnownName: d.name) }
@@ -109,7 +113,15 @@ extension AppStore {
                 previous.eq = eq(for: app)
                 applyEQ(e, to: app, origin: origin)
             }
-            if previous.volume != nil || previous.eq != nil { undo.apps[app] = previous }
+            if profile.aspects.contains(.appEffects), let fx = setting.effects {
+                previous.effects = preferences.effects(for: app)
+                setEffects(fx, for: app)
+            }
+            if profile.aspects.contains(.appRoutes), let route = setting.route {
+                previous.route = preferences.route(for: app).map { .device($0) } ?? .system
+                applyRoute(route.device, for: app)
+            }
+            if !previous.isEmpty { undo.apps[app] = previous }
         }
         if profile.aspects.contains(.outputDevice), let target = profile.output {
             if let device = outputDevices.first(where: { $0.id == target.id }) {
@@ -135,6 +147,8 @@ extension AppStore {
         for (app, setting) in undo.apps {
             if let v = setting.volume { apply(v, to: app, origin: .profile) }
             if let e = setting.eq { applyEQ(e, to: app, origin: .profile) }
+            if let fx = setting.effects { setEffects(fx, for: app) }
+            if let route = setting.route { applyRoute(route.device, for: app) }
         }
         if let target = undo.output, target.id != selectedOutput.confirmed,
            let device = outputDevices.first(where: { $0.id == target.id }) {

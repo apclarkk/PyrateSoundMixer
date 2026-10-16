@@ -5,14 +5,14 @@ import PyrateCore
 /// One source's realtime processing chain:
 ///
 ///     tap input -> loudness makeup -> EQ (10 biquads per channel) -> channel mode + balance
-///               -> Apple effects rack -> normalizer trim -> volume ramp -> lookahead peak limiter -> output
+///               -> Apple effects rack -> volume ramp -> lookahead peak limiter -> output
 ///
 /// Each tapped source owns its own chain, so EQ and effects never leak between apps.
 ///
-/// Threading: `setGain`, `setEQ`, `setLeveling` and `setSampleRate` are called on the
+/// Threading: `setGain`, `setEQ`, `setEffects` and `setSampleRate` are called on the
 /// main thread. `process` runs on the realtime IO thread and never locks or allocates.
 /// Scalars cross threads through C11 atomics; sample-rate dependent designs cross
-/// through a lock-free triple buffer.
+/// through a lock-free triple buffer; the effects rack crosses through an atomic pointer.
 public final class ProcessingChain: @unchecked Sendable {
     public static let maxBands = GraphicEQ.bandCount
     static let channels = 2
@@ -20,69 +20,47 @@ public final class ProcessingChain: @unchecked Sendable {
     // Slot layout (Double): header, then b0 b1 b2 a1 a2 for each EQ band.
     enum Field {
         static let eqEnabled = 0, preGain = 1, bandCount = 2, limiterRelease = 3, lookahead = 4
-        static let kWeight1 = 5, kWeight2 = 10
-        static let hopSamples = 15, learningSamples = 16
-        static let header = 17
+        static let header = 5
     }
     static let slotSize = Field.header + maxBands * 5
     static let eqStateSize = channels * maxBands * 2
-    static let kStateSize = channels * 2 * 2
     /// Upper bound on lookahead samples (5 ms at 192 kHz is 960).
     static let maxLookahead = 2048
     static let limiterCeiling = Float(GraphicEQ.limiterCeiling)
     /// Last-resort safety above the limiter ceiling.
     static let clipKnee: Float = 0.95
+    static let maxChunk = EffectRack.maxFrames
 
     // Shared with the IO thread
     private let targetGain: OpaquePointer
     private let peak: OpaquePointer
-    private let levelerEnabled: OpaquePointer
-    private let levelerTarget: OpaquePointer
-    private let levelerReport: OpaquePointer
     private let balanceLeft: OpaquePointer
     private let balanceRight: OpaquePointer
     private let channelMode: OpaquePointer
-    /// The live effects rack (an unretained `EffectRack`), or nil.
-    private let rackPointer: OpaquePointer
-    /// Strong reference to the rack the IO thread uses; retired racks are freed a
-    /// second after being swapped out, long after any render call that saw them.
-    private var rack: EffectRack?
-    public private(set) var rackSkipped: [String] = []
-    static let maxChunk = EffectRack.maxFrames
-    private let scratchL: UnsafeMutablePointer<Float>
-    private let scratchR: UnsafeMutablePointer<Float>
-    private let levelerBoostOnly: OpaquePointer
-    /// A trim to start from (NaN when none), e.g. what this app settled at earlier.
-    private let levelerSeed: OpaquePointer
     private let triple: OpaquePointer
     private let slots: UnsafeMutablePointer<Double>
+    /// The live effects rack (an unretained `EffectRack`), or nil.
+    private let rackPointer: OpaquePointer
 
     // Main-thread side
     public private(set) var sampleRate: Double
     public private(set) var eq: SourceEQ = .off
-    public private(set) var leveling: LevelingSettings?
     public private(set) var effects: SourceEffects = .neutral
+    public private(set) var rackSkipped: [String] = []
+    /// Strong reference to the rack the IO thread uses; retired racks are freed a
+    /// second after being swapped out, long after any render call that saw them.
+    private var rack: EffectRack?
 
     // Realtime side (only touched inside `process`)
     private var currentGain: Float
     private var currentBalanceL: Float = 1
     private var currentBalanceR: Float = 1
+    private var currentMode = 0
     private let previousSlot: UnsafeMutablePointer<Double>
     private let eqState: UnsafeMutablePointer<Double>
     private let previousEQState: UnsafeMutablePointer<Double>
-    private let kState: UnsafeMutablePointer<Double>
-    private var levelDB: Double = 0
-    private var levelLinear: Float = 1
-    private var samplesSeen = 0
-    // Normalizer measurement: 100 ms hops, 400 ms blocks, 30 s window of blocks.
-    private var hopEnergy: Double = 0
-    private var hopCount = 0
-    private let hopRing: UnsafeMutablePointer<Double>
-    private var hopsDone = 0
-    private let blockRing: UnsafeMutablePointer<Double>
-    private var blocksDone = 0
-    private var heardBlocks = 0
-    private var correcting = false
+    private let scratchL: UnsafeMutablePointer<Float>
+    private let scratchR: UnsafeMutablePointer<Float>
     // Lookahead limiter
     private let delayL: UnsafeMutablePointer<Float>
     private let delayR: UnsafeMutablePointer<Float>
@@ -99,66 +77,44 @@ public final class ProcessingChain: @unchecked Sendable {
         self.sampleRate = sampleRate
         targetGain = pyr_atomic_float_create(gain)
         peak = pyr_atomic_float_create(0)
-        levelerEnabled = pyr_atomic_float_create(0)
-        levelerTarget = pyr_atomic_float_create(Float(LevelingSettings.Target.balanced.lufs))
-        levelerReport = pyr_atomic_float_create(0)
         balanceLeft = pyr_atomic_float_create(1)
         balanceRight = pyr_atomic_float_create(1)
         channelMode = pyr_atomic_float_create(0)
         rackPointer = pyr_atomic_ptr_create(nil)
-        scratchL = .allocate(capacity: Self.maxChunk)
-        scratchL.initialize(repeating: 0, count: Self.maxChunk)
-        scratchR = .allocate(capacity: Self.maxChunk)
-        scratchR.initialize(repeating: 0, count: Self.maxChunk)
-        levelerBoostOnly = pyr_atomic_float_create(0)
-        levelerSeed = pyr_atomic_float_create(.nan)
-        hopRing = .allocate(capacity: LevelerTuning.blockHops)
-        hopRing.initialize(repeating: 0, count: LevelerTuning.blockHops)
-        blockRing = .allocate(capacity: LevelerTuning.windowBlocks)
-        blockRing.initialize(repeating: 0, count: LevelerTuning.windowBlocks)
         triple = pyr_tb_create()
-        slots = .allocate(capacity: Self.slotSize * 3)
-        slots.initialize(repeating: 0, count: Self.slotSize * 3)
-        previousSlot = .allocate(capacity: Self.slotSize)
-        previousSlot.initialize(repeating: 0, count: Self.slotSize)
-        eqState = .allocate(capacity: Self.eqStateSize)
-        eqState.initialize(repeating: 0, count: Self.eqStateSize)
-        previousEQState = .allocate(capacity: Self.eqStateSize)
-        previousEQState.initialize(repeating: 0, count: Self.eqStateSize)
-        kState = .allocate(capacity: Self.kStateSize)
-        kState.initialize(repeating: 0, count: Self.kStateSize)
-        delayL = .allocate(capacity: Self.maxLookahead)
-        delayL.initialize(repeating: 0, count: Self.maxLookahead)
-        delayR = .allocate(capacity: Self.maxLookahead)
-        delayR.initialize(repeating: 0, count: Self.maxLookahead)
-        windowValues = .allocate(capacity: Self.maxLookahead + 1)
-        windowValues.initialize(repeating: 1, count: Self.maxLookahead + 1)
-        windowIndices = .allocate(capacity: Self.maxLookahead + 1)
-        windowIndices.initialize(repeating: 0, count: Self.maxLookahead + 1)
-        boxRing = .allocate(capacity: Self.maxLookahead)
-        boxRing.initialize(repeating: 1, count: Self.maxLookahead)
+        slots = Self.buffer(Self.slotSize * 3, 0)
+        previousSlot = Self.buffer(Self.slotSize, 0)
+        eqState = Self.buffer(Self.eqStateSize, 0)
+        previousEQState = Self.buffer(Self.eqStateSize, 0)
+        scratchL = Self.buffer(Self.maxChunk, 0)
+        scratchR = Self.buffer(Self.maxChunk, 0)
+        delayL = Self.buffer(Self.maxLookahead, 0)
+        delayR = Self.buffer(Self.maxLookahead, 0)
+        windowValues = Self.buffer(Self.maxLookahead + 1, 1)
+        windowIndices = Self.buffer(Self.maxLookahead + 1, 0)
+        boxRing = Self.buffer(Self.maxLookahead, 1)
         currentGain = gain
         // Every slot starts with a valid design so the IO thread never reads zeros.
-        let initial = EQDesign.bypass
-        for _ in 0..<3 { publish(initial) }
+        for _ in 0..<3 { publish(.bypass) }
         pyr_tb_acquire(triple)
     }
 
+    private static func buffer<T>(_ count: Int, _ value: T) -> UnsafeMutablePointer<T> {
+        let p = UnsafeMutablePointer<T>.allocate(capacity: count)
+        p.initialize(repeating: value, count: count)
+        return p
+    }
+
     deinit {
-        [targetGain, peak, levelerEnabled, levelerTarget, levelerReport, levelerBoostOnly, levelerSeed,
-         balanceLeft, balanceRight, channelMode]
-            .forEach { pyr_atomic_float_destroy($0) }
+        [targetGain, peak, balanceLeft, balanceRight, channelMode].forEach { pyr_atomic_float_destroy($0) }
         pyr_atomic_ptr_destroy(rackPointer)
-        scratchL.deallocate()
-        scratchR.deallocate()
-        hopRing.deallocate()
-        blockRing.deallocate()
         pyr_tb_destroy(triple)
         slots.deallocate()
         previousSlot.deallocate()
         eqState.deallocate()
         previousEQState.deallocate()
-        kState.deallocate()
+        scratchL.deallocate()
+        scratchR.deallocate()
         delayL.deallocate()
         delayR.deallocate()
         windowValues.deallocate()
@@ -168,6 +124,9 @@ public final class ProcessingChain: @unchecked Sendable {
 
     /// Latency the chain adds, in seconds (the limiter's lookahead).
     public var latency: Double { GraphicEQ.limiterLookaheadSeconds }
+
+    /// Latency the effects rack adds, in seconds.
+    public var rackLatency: Double { rack?.latency ?? 0 }
 
     // MARK: Main thread
 
@@ -179,14 +138,6 @@ public final class ProcessingChain: @unchecked Sendable {
         guard eq != self.eq else { return }
         self.eq = eq
         publish(EQDesign(eq, sampleRate: sampleRate))
-    }
-
-    /// Turns loudness normalization on with its settings, or off with nil.
-    public func setLeveling(_ settings: LevelingSettings?) {
-        leveling = settings
-        pyr_store_float(levelerTarget, Float((settings?.target ?? .balanced).lufs))
-        pyr_store_float(levelerBoostOnly, settings?.boostOnly == true ? 1 : 0)
-        pyr_store_float(levelerEnabled, settings == nil ? 0 : 1)
     }
 
     /// Balance, channel mode, and the Apple effects rack for this source.
@@ -207,17 +158,20 @@ public final class ProcessingChain: @unchecked Sendable {
         pyr_store_float(channelMode, mode)
     }
 
-    /// Starts the normalizer from a known trim instead of 0 dB. Call before audio flows.
-    public func seedLeveler(_ db: Float) {
-        pyr_store_float(levelerSeed, db)
-    }
-
     @MainActor
     public func setSampleRate(_ rate: Double) {
         guard rate > 0, rate != sampleRate else { return }
         sampleRate = rate
         publish(EQDesign(eq, sampleRate: rate))
         if rack != nil { installRack(effects.rack) }
+    }
+
+    /// Input peak since the last call, then resets it. Best effort; a lost update
+    /// only means one meter frame is slightly off.
+    public func takePeak() -> Float {
+        let value = pyr_load_float(peak)
+        pyr_store_float(peak, 0)
+        return value
     }
 
     /// Parameter and bypass changes go to the running units; anything structural
@@ -244,20 +198,6 @@ public final class ProcessingChain: @unchecked Sendable {
         rack = fresh
     }
 
-    /// Latency the effects rack adds, in seconds.
-    public var rackLatency: Double { rack?.latency ?? 0 }
-
-    /// Input peak since the last call, then resets it. Best effort; a lost update
-    /// only means one meter frame is slightly off.
-    public func takePeak() -> Float {
-        let value = pyr_load_float(peak)
-        pyr_store_float(peak, 0)
-        return value
-    }
-
-    /// The leveler's current adjustment in dB (0 when off or settled at target).
-    public var levelerAdjustmentDB: Float { pyr_load_float(levelerReport) }
-
     func publish(_ design: EQDesign) {
         let slot = slots + Int(pyr_tb_back(triple)) * Self.slotSize
         slot[Field.eqEnabled] = design.isEnabled ? 1 : 0
@@ -266,19 +206,11 @@ public final class ProcessingChain: @unchecked Sendable {
         slot[Field.bandCount] = Double(count)
         slot[Field.limiterRelease] = 1 - exp(-1 / (GraphicEQ.limiterReleaseSeconds * sampleRate))
         slot[Field.lookahead] = min(max((GraphicEQ.limiterLookaheadSeconds * sampleRate).rounded(), 1), Double(Self.maxLookahead))
-        let k = LevelerTuning.kWeighting(sampleRate: sampleRate)
-        Self.write(k[0], to: slot + Field.kWeight1)
-        Self.write(k[1], to: slot + Field.kWeight2)
-        slot[Field.hopSamples] = (LevelerTuning.hopSeconds * sampleRate).rounded()
-        slot[Field.learningSamples] = LevelerTuning.learningSeconds * sampleRate
         for (i, q) in design.biquads.prefix(count).enumerated() {
-            Self.write(q, to: slot + Field.header + i * 5)
+            let c = slot + Field.header + i * 5
+            c[0] = q.b0; c[1] = q.b1; c[2] = q.b2; c[3] = q.a1; c[4] = q.a2
         }
         pyr_tb_publish(triple)
-    }
-
-    private static func write(_ q: Biquad, to c: UnsafeMutablePointer<Double>) {
-        c[0] = q.b0; c[1] = q.b1; c[2] = q.b2; c[3] = q.a1; c[4] = q.a2
     }
 
     // MARK: Realtime thread
@@ -313,7 +245,7 @@ public final class ProcessingChain: @unchecked Sendable {
         mono: Bool, frames: Int
     ) {
         // Take a new design if one was published, keeping the old one (and its
-        // filter state) to crossfade from across this buffer.
+        // filter state) to crossfade from across this chunk.
         var crossfade = false
         if pyr_tb_has_fresh(triple) {
             previousSlot.update(from: slots + Int(pyr_tb_front(triple)) * Self.slotSize, count: Self.slotSize)
@@ -325,9 +257,10 @@ public final class ProcessingChain: @unchecked Sendable {
         let eqOn = slot[Field.eqEnabled] != 0
         if crossfade && !eqOn && previousSlot[Field.eqEnabled] == 0 { crossfade = false }
 
-        let leveling = pyr_load_float(levelerEnabled) != 0
         let rackRaw = pyr_atomic_ptr_load(rackPointer)
-        let protect = eqOn || leveling || rackRaw != nil || (crossfade && previousSlot[Field.eqEnabled] != 0)
+        // The ceiling guards anything that can add level; untouched audio only gets
+        // the full-scale safety.
+        let protect = eqOn || rackRaw != nil || (crossfade && previousSlot[Field.eqEnabled] != 0)
         let ceiling = protect ? Self.limiterCeiling : 1
         let release = Float(slot[Field.limiterRelease])
 
@@ -338,31 +271,17 @@ public final class ProcessingChain: @unchecked Sendable {
         let cap = Self.maxLookahead
         let windowCap = cap + 1
 
-        let seed = pyr_load_float(levelerSeed)
-        if !seed.isNaN {
-            levelDB = Double(seed)
-            levelLinear = Float(pow(10, levelDB / 20))
-            pyr_store_float(levelerSeed, .nan)
-        }
-
-        // Volume and normalizer gains ramp across the buffer.
+        let fadeStep = 1 / Float(frames)
         let volumeStart = currentGain
         let volumeTarget = pyr_load_float(targetGain)
         let volumeStep = (volumeTarget - volumeStart) / Float(frames)
-        let levelStart = levelLinear
-        let levelTarget = Float(pow(10, levelDB / 20))
-        let levelStep = (levelTarget - levelStart) / Float(frames)
-        let hopSamples = max(Int(slot[Field.hopSamples]), 1)
-        let fadeStep = 1 / Float(frames)
+        // A channel mode change crossfades from the old mode to the new one.
         let mode = Int(pyr_load_float(channelMode))
-        let balLStart = currentBalanceL, balRStart = currentBalanceR
+        let oldMode = currentMode
         let balLTarget = pyr_load_float(balanceLeft), balRTarget = pyr_load_float(balanceRight)
-        let balLStep = (balLTarget - balLStart) / Float(frames)
-        let balRStep = (balRTarget - balRStart) / Float(frames)
-        var balL = balLStart, balR = balRStart
-
-        var volume = volumeStart
-        var level = levelStart
+        let balLStep = (balLTarget - currentBalanceL) / Float(frames)
+        let balRStep = (balRTarget - currentBalanceR) / Float(frames)
+        var balL = currentBalanceL, balR = currentBalanceR
         var maxPeak: Float = 0
 
         // Pass 1, per sample: EQ, channel mode, balance.
@@ -373,26 +292,24 @@ public final class ProcessingChain: @unchecked Sendable {
 
             var yl = Float(Self.equalize(Double(l), channel: 0, slot: slot, state: eqState))
             var yr = Float(Self.equalize(Double(r), channel: 1, slot: slot, state: eqState))
+            let t = Float(frame + 1) * fadeStep
             if crossfade {
-                let t = Float(frame + 1) * fadeStep
                 let pl = Float(Self.equalize(Double(l), channel: 0, slot: previousSlot, state: previousEQState))
                 let pr = Float(Self.equalize(Double(r), channel: 1, slot: previousSlot, state: previousEQState))
                 yl = pl + (yl - pl) * t
                 yr = pr + (yr - pr) * t
             }
 
-            // Channel mode, then level-neutral balance (ramped so moves are smooth).
-            if mode == 1 {
-                swap(&yl, &yr)
-            } else if mode == 2 {
-                let m = (yl + yr) * 0.5
-                yl = m
-                yr = m
+            var (ml, mr) = Self.applyMode(mode, yl, yr)
+            if oldMode != mode {
+                let (ol, or) = Self.applyMode(oldMode, yl, yr)
+                ml = ol + (ml - ol) * t
+                mr = or + (mr - or) * t
             }
             balL += balLStep
             balR += balRStep
-            scratchL[frame] = yl * balL
-            scratchR[frame] = yr * balR
+            scratchL[frame] = ml * balL
+            scratchR[frame] = mr * balR
         }
 
         // Pass 2, per block: the Apple effects rack, in place.
@@ -402,31 +319,17 @@ public final class ProcessingChain: @unchecked Sendable {
             }
         }
 
-        // Pass 3, per sample: measurement, gains, lookahead limiter, output.
+        // Pass 3, per sample: volume and the lookahead limiter. The limiter takes the
+        // gain each sample needs, a sliding minimum over the lookahead window, then a
+        // box average of that minimum. The average reaches each peak's gain exactly
+        // when the peak leaves the delay line, so the ceiling holds without the gain
+        // jumping inside a waveform.
+        var volume = volumeStart
         for frame in 0..<frames {
             volume += volumeStep
-            level += levelStep
-            let yl = scratchL[frame]
-            let yr = scratchR[frame]
+            let a = scratchL[frame] * volume
+            let b = scratchR[frame] * volume
 
-            if leveling {
-                // K-weighted energy of both channels (BS.1770), measured before the
-                // trim so the loop is open and stable.
-                let kl = Self.kWeight(Double(yl), channel: 0, slot: slot, state: kState)
-                let kr = Self.kWeight(Double(yr), channel: 1, slot: slot, state: kState)
-                hopEnergy += kl * kl + kr * kr
-                hopCount += 1
-                if hopCount >= hopSamples { completeHop(slot: slot) }
-            }
-
-            let g = volume * level
-            let a = yl * g
-            let b = yr * g
-
-            // Lookahead limiter: the gain each sample needs, a sliding minimum over
-            // the lookahead window, then a box average of that minimum. The average
-            // reaches each peak's gain exactly when the peak leaves the delay line,
-            // so the ceiling holds without the gain jumping inside a waveform.
             let lvl = max(abs(a), abs(b))
             let need = lvl > ceiling ? ceiling / lvl : 1
             while windowTail > windowHead && windowValues[(windowTail - 1) % windowCap] >= need {
@@ -463,68 +366,18 @@ public final class ProcessingChain: @unchecked Sendable {
         currentGain = volumeTarget
         currentBalanceL = balLTarget
         currentBalanceR = balRTarget
-        levelLinear = levelTarget
-        samplesSeen += frames
-        if !leveling && levelDB != 0 {
-            // Turned off: glide back to unity at the normal rate.
-            let step = LevelerTuning.slewDBPerSecond * Double(frames) / sampleRateFromSlot(slot)
-            levelDB = abs(levelDB) <= step ? 0 : levelDB - (levelDB > 0 ? step : -step)
-            correcting = false
-        }
-        pyr_store_float(levelerReport, Float(levelDB))
+        currentMode = mode
         // Keep the counters small; the modulo arithmetic only needs them consistent.
         if sampleIndex > 1 << 40 { resetLimiter(lookahead: lookahead) }
         if maxPeak > pyr_load_float(peak) { pyr_store_float(peak, maxPeak) }
     }
 
-    private func sampleRateFromSlot(_ slot: UnsafeMutablePointer<Double>) -> Double {
-        max(slot[Field.hopSamples] / LevelerTuning.hopSeconds, 1)
-    }
-
-    /// Every 100 ms: close a hop, form the latest 400 ms block, and re-evaluate.
-    private func completeHop(slot: UnsafeMutablePointer<Double>) {
-        let hopMS = hopEnergy / Double(hopCount)
-        hopEnergy = 0
-        hopCount = 0
-        hopRing[hopsDone % LevelerTuning.blockHops] = hopMS
-        hopsDone += 1
-        guard hopsDone >= LevelerTuning.blockHops else { return }
-
-        var block = 0.0
-        for i in 0..<LevelerTuning.blockHops { block += hopRing[i] }
-        block /= Double(LevelerTuning.blockHops)
-        blockRing[blocksDone % LevelerTuning.windowBlocks] = block
-        blocksDone += 1
-        if LevelerTuning.loudnessOffset + 10 * log10(block + 1e-20) > LevelerTuning.absoluteGateLUFS {
-            heardBlocks += 1
-        }
-        updateNormalizer(slot: slot)
-    }
-
-    /// Nudges the trim toward the target. Holds until enough real audio has been
-    /// heard, does nothing inside the deadband, and never moves faster than the slew.
-    private func updateNormalizer(slot: UnsafeMutablePointer<Double>) {
-        let minimumBlocks = Int(LevelerTuning.minimumHeardSeconds / LevelerTuning.hopSeconds)
-        guard heardBlocks >= minimumBlocks else { return }
-        let window = UnsafeBufferPointer(start: blockRing, count: min(blocksDone, LevelerTuning.windowBlocks))
-        guard let loudness = LevelerTuning.integratedLoudness(window) else { return }
-
-        let desired = LevelerTuning.desiredTrim(
-            loudness: loudness,
-            target: Double(pyr_load_float(levelerTarget)),
-            boostOnly: pyr_load_float(levelerBoostOnly) != 0)
-        let error = desired - levelDB
-        if !correcting && abs(error) > LevelerTuning.deadbandDB { correcting = true }
-        guard correcting else { return }
-
-        let learning = Double(samplesSeen) < slot[Field.learningSamples]
-        let rate = learning ? LevelerTuning.learningSlewDBPerSecond : LevelerTuning.slewDBPerSecond
-        let step = rate * LevelerTuning.hopSeconds
-        if abs(error) <= step {
-            levelDB = desired
-            correcting = false
-        } else {
-            levelDB += error > 0 ? step : -step
+    @inline(__always)
+    static func applyMode(_ mode: Int, _ l: Float, _ r: Float) -> (Float, Float) {
+        switch mode {
+        case 1: return (r, l)
+        case 2: let m = (l + r) * 0.5; return (m, m)
+        default: return (l, r)
         }
     }
 
@@ -549,23 +402,13 @@ public final class ProcessingChain: @unchecked Sendable {
         let count = Int(slot[Field.bandCount])
         let s = state + channel * maxBands * 2
         for band in 0..<count {
-            y = biquad(y, coefficients: slot + Field.header + band * 5, state: s + band * 2)
+            let c = slot + Field.header + band * 5
+            let z = s + band * 2
+            let out = c[0] * y + z[0]
+            z[0] = c[1] * y - c[3] * out + z[1]
+            z[1] = c[2] * y - c[4] * out
+            y = out
         }
-        return y
-    }
-
-    @inline(__always)
-    static func kWeight(_ x: Double, channel: Int, slot: UnsafeMutablePointer<Double>, state: UnsafeMutablePointer<Double>) -> Double {
-        let s = state + channel * 4
-        let y = biquad(x, coefficients: slot + Field.kWeight1, state: s)
-        return biquad(y, coefficients: slot + Field.kWeight2, state: s + 2)
-    }
-
-    @inline(__always)
-    static func biquad(_ x: Double, coefficients c: UnsafeMutablePointer<Double>, state z: UnsafeMutablePointer<Double>) -> Double {
-        let y = c[0] * x + z[0]
-        z[0] = c[1] * x - c[3] * y + z[1]
-        z[1] = c[2] * x - c[4] * y
         return y
     }
 

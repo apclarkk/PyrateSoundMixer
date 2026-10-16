@@ -6,26 +6,45 @@ import Foundation
 /// the aspects it includes, so profiles layer: "Meeting volumes" can be combined
 /// with "Headphone EQ" without one overwriting the other.
 public enum ProfileAspect: String, Codable, CaseIterable, Sendable {
-    case appVolumes, appEQ, outputDevice, inputDevice
+    case appVolumes, appEQ, appEffects, appRoutes, outputDevice, inputDevice
 
     public var title: String {
         switch self {
         case .appVolumes: return "App volumes and mutes"
         case .appEQ: return "App EQ"
+        case .appEffects: return "App effects (balance, channels, Apple effects)"
+        case .appRoutes: return "Which output each app plays through"
         case .outputDevice: return "Output device"
         case .inputDevice: return "Input device"
         }
     }
 }
 
+/// Where a profile sends an app: the system output or a specific device.
+public enum ProfileRoute: Codable, Hashable, Sendable {
+    case system
+    case device(RememberedDevice)
+
+    public var device: RememberedDevice? {
+        if case .device(let d) = self { return d }
+        return nil
+    }
+}
+
 public struct ProfileAppSetting: Codable, Hashable, Sendable {
     public var volume: VolumeState?
     public var eq: SourceEQ?
+    public var effects: SourceEffects?
+    public var route: ProfileRoute?
 
-    public init(volume: VolumeState? = nil, eq: SourceEQ? = nil) {
+    public init(volume: VolumeState? = nil, eq: SourceEQ? = nil, effects: SourceEffects? = nil, route: ProfileRoute? = nil) {
         self.volume = volume
         self.eq = eq
+        self.effects = effects
+        self.route = route
     }
+
+    public var isEmpty: Bool { volume == nil && eq == nil && effects == nil && route == nil }
 }
 
 extension SourceEQ: Hashable {
@@ -66,6 +85,14 @@ public struct Profile: Codable, Hashable, Identifiable, Sendable {
         if aspects.contains(.appEQ) {
             let n = apps.values.filter { $0.eq != nil }.count
             parts.append("\(n) app EQ\(n == 1 ? "" : "s")")
+        }
+        if aspects.contains(.appEffects) {
+            let n = apps.values.filter { $0.effects.map { !$0.isNeutral } ?? false }.count
+            parts.append("effects on \(n) app\(n == 1 ? "" : "s")")
+        }
+        if aspects.contains(.appRoutes) {
+            let n = apps.values.filter { $0.route?.device != nil }.count
+            parts.append("\(n) app route\(n == 1 ? "" : "s")")
         }
         if aspects.contains(.outputDevice), let output { parts.append("output \(output.lastKnownName)") }
         if aspects.contains(.inputDevice), let input { parts.append("input \(input.lastKnownName)") }

@@ -16,26 +16,22 @@ public final class TapCoordinator {
         public var destinationUID: String
         public var gain: Float
         public var eq: SourceEQ
-        /// Normalization settings, or nil when this source is not normalized.
-        public var leveling: LevelingSettings?
         public var effects: SourceEffects
 
         public init(name: String, processObjectIDs: [AudioObjectID], destinationUID: String, gain: Float,
-                    eq: SourceEQ, leveling: LevelingSettings? = nil, effects: SourceEffects = .neutral) {
+                    eq: SourceEQ, effects: SourceEffects = .neutral) {
             self.name = name
             self.processObjectIDs = processObjectIDs
             self.destinationUID = destinationUID
             self.gain = gain
             self.eq = eq
-            self.leveling = leveling
             self.effects = effects
         }
 
-        /// Whether a source with these settings needs a tap at all. Leveling only
-        /// taps sources that are playing, so idle apps don't keep audio IO running.
-        public static func needsTap(volume: VolumeState, eq: SourceEQ, leveled: Bool, isActive: Bool,
+        /// Whether a source with these settings needs a tap at all.
+        public static func needsTap(volume: VolumeState, eq: SourceEQ,
                                     effects: SourceEffects = .neutral, routed: Bool = false) -> Bool {
-            !volume.isUnity || eq.isActive || (leveled && isActive) || !effects.isNeutral || routed
+            !volume.isUnity || eq.isActive || !effects.isNeutral || routed
         }
     }
 
@@ -47,9 +43,6 @@ public final class TapCoordinator {
     private var engines: [SourceID: TapEngine] = [:]
     private var engineStarted: [SourceID: Date] = [:]
     private var lingerTasks: [SourceID: Task<Void, Never>] = [:]
-    /// Trim each source settled at, kept for the session so an app that pauses and
-    /// resumes picks up where it left off instead of relearning from 0 dB.
-    private var levelerMemory: [SourceID: Float] = [:]
 
     public init() {}
 
@@ -91,11 +84,6 @@ public final class TapCoordinator {
     /// Sample rate a source is being processed at, when tapped.
     public func sampleRate(_ id: SourceID) -> Double? { engines[id]?.chain.sampleRate }
 
-    /// The leveler's current adjustment for a source in dB, when it is being leveled.
-    public func levelerAdjustment(_ id: SourceID) -> Float? {
-        guard let chain = engines[id]?.chain, chain.leveling != nil else { return nil }
-        return chain.levelerAdjustmentDB
-    }
 
     /// - Parameters:
     ///   - desired: sources that need a tap now, with their target gain.
@@ -110,24 +98,16 @@ public final class TapCoordinator {
                engine.destinationUID == request.destinationUID {
                 engine.chain.setGain(request.gain)
                 engine.chain.setEQ(request.eq)
-                engine.chain.setLeveling(request.leveling)
                 engine.chain.setEffects(request.effects)
                 continue
             }
 
-            if let chain = engines[id]?.chain, chain.leveling != nil {
-                levelerMemory[id] = chain.levelerAdjustmentDB
-            }
             engines[id]?.stop()
             engines[id] = nil
             do {
                 engines[id] = try TapEngine(
                     sourceID: id, name: request.name, processObjectIDs: request.processObjectIDs,
                     destinationUID: request.destinationUID, gain: request.gain, eq: request.eq)
-                if request.leveling != nil, let remembered = levelerMemory[id] {
-                    engines[id]?.chain.seedLeveler(remembered)
-                }
-                engines[id]?.chain.setLeveling(request.leveling)
                 engines[id]?.chain.setEffects(request.effects)
                 engineStarted[id] = Date()
                 errors[id] = nil
@@ -144,7 +124,6 @@ public final class TapCoordinator {
             }
             engines[id]?.chain.setGain(1)
             engines[id]?.chain.setEQ(.off)
-            engines[id]?.chain.setLeveling(nil)
             engines[id]?.chain.setEffects(.neutral)
             guard lingerTasks[id] == nil else { continue }
             let delay = lingerInterval
@@ -167,14 +146,8 @@ public final class TapCoordinator {
     private func tearDown(_ id: SourceID) {
         lingerTasks[id]?.cancel()
         lingerTasks[id] = nil
-        if let chain = engines[id]?.chain, chain.leveling != nil {
-            levelerMemory[id] = chain.levelerAdjustmentDB
-        }
         engines[id]?.stop()
         engines[id] = nil
         engineStarted[id] = nil
     }
-
-    /// Forgets learned trims, e.g. when the target changes.
-    public func resetLevelerMemory() { levelerMemory.removeAll() }
 }

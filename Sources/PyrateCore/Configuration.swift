@@ -143,7 +143,11 @@ extension Preferences {
         add(preferredOutput)
         add(preferredInput)
         apps.values.forEach { add($0.route) }
-        for profile in profiles { add(profile.output); add(profile.input) }
+        for profile in profiles {
+            add(profile.output)
+            add(profile.input)
+            profile.apps.values.forEach { add($0.route?.device) }
+        }
         for rule in rules {
             switch rule.trigger {
             case .deviceConnected(let id), .outputIs(let id):
@@ -174,6 +178,11 @@ extension Preferences {
         for i in p.profiles.indices {
             p.profiles[i].output = swap(p.profiles[i].output)
             p.profiles[i].input = swap(p.profiles[i].input)
+            for app in Array(p.profiles[i].apps.keys) {
+                if case .device(let d)? = p.profiles[i].apps[app]?.route, let mapped = map[d.id] {
+                    p.profiles[i].apps[app]?.route = .device(mapped)
+                }
+            }
         }
         for i in p.rules.indices {
             switch p.rules[i].trigger {

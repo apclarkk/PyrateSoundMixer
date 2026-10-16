@@ -181,6 +181,12 @@ struct ProfileDetail: View {
         if profile.aspects.contains(.appEQ), let e = setting.eq {
             parts.append("EQ " + (store.preferences.eqPreset(id: e.presetID)?.name ?? "custom"))
         }
+        if profile.aspects.contains(.appEffects), let fx = setting.effects, let summary = fx.summary {
+            parts.append(summary)
+        }
+        if profile.aspects.contains(.appRoutes), let device = setting.route?.device {
+            parts.append("to \(device.lastKnownName)")
+        }
         return parts.joined(separator: ", ")
     }
 }

@@ -186,3 +186,35 @@ struct ProfileHistoryTests {
         #expect(log.entries.last?.message == "\(ActivityLog.maxEntries + 9)")
     }
 }
+
+@Suite("Profile effects and routes")
+struct ProfileEffectsRoutesTests {
+    let airpods = RememberedDevice(id: DeviceID(uid: "airpods"), lastKnownName: "AirPods")
+    let speakers = RememberedDevice(id: DeviceID(uid: "speakers"), lastKnownName: "Speakers")
+
+    @Test func summaryCountsEffectsAndRoutes() {
+        let p = Profile(name: "Night", aspects: [.appEffects, .appRoutes], apps: [
+            SourceID("a"): ProfileAppSetting(effects: SourceEffects(rack: [.make("rvb2")]), route: .device(airpods)),
+            SourceID("b"): ProfileAppSetting(effects: .neutral, route: .system),
+        ])
+        #expect(p.summary == "effects on 1 app, 1 app route")
+    }
+
+    @Test func profileRoutesRoundTripAndRemap() throws {
+        var prefs = Preferences()
+        prefs.profiles = [Profile(name: "Commute", aspects: [.appRoutes],
+                                  apps: [SourceID("music"): ProfileAppSetting(route: .device(airpods))])]
+        let loaded = try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(prefs))
+        #expect(loaded.profiles == prefs.profiles)
+        #expect(prefs.referencedDevices().contains { $0.id == airpods.id })
+        let mapped = prefs.remappingDevices([airpods.id: speakers])
+        #expect(mapped.profiles[0].apps[SourceID("music")]?.route == .device(speakers))
+    }
+
+    @Test func oldProfilesWithoutNewAspectsStillLoad() throws {
+        let json = #"{"profiles":[{"id":"p","name":"Old","aspects":["appVolumes"],"apps":{"x":{"volume":{"level":0.4,"isMuted":false}}}}]}"#
+        let prefs = try JSONDecoder().decode(Preferences.self, from: Data(json.utf8))
+        #expect(prefs.profiles.first?.apps[SourceID("x")]?.effects == nil)
+        #expect(prefs.profiles.first?.apps[SourceID("x")]?.volume?.level == 0.4)
+    }
+}
